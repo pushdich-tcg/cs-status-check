@@ -12,7 +12,8 @@ const {
   PSA_TOKEN,
   ALLOWED_ORIGINS = "",
   CS_NUMBER_PATTERN = "^#?(\\d{6,12})$",
-  CACHE_MINUTES = "15",
+  CACHE_MINUTES = "180",
+  PSA_DAILY_LIMIT = "90",
   ADMIN_KEY,
 } = process.env;
 
@@ -25,6 +26,17 @@ const PSA_BASE = "https://api.psacard.com/publicapi";
 const csPattern = new RegExp(CS_NUMBER_PATTERN, "i");
 const cacheMs = Number(CACHE_MINUTES) * 60 * 1000;
 const cache = new Map();
+
+// PSA erlaubt nur 100 Abrufe pro Tag und Token. Wir zählen mit und bleiben darunter.
+let budget = { day: new Date().toISOString().slice(0, 10), used: 0, blockedUntil: 0 };
+function takeBudget() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (budget.day !== today) budget = { day: today, used: 0, blockedUntil: 0 };
+  if (Date.now() < budget.blockedUntil) return false;
+  if (budget.used >= Number(PSA_DAILY_LIMIT)) return false;
+  budget.used += 1;
+  return true;
+}
 
 const app = express();
 app.set("trust proxy", 1);
@@ -47,6 +59,7 @@ function extractPsaNumber(input) {
 
 // ---------- PSA-Aufrufe ----------
 async function psaGet(path) {
+  if (!takeBudget()) throw new Error("PSA_QUOTA");
   const token = PSA_TOKEN.trim().replace(/^bearer\s+/i, "").replace(/^["']|["']$/g, "");
   const res = await fetch(`${PSA_BASE}${path}`, {
     headers: {
@@ -60,6 +73,11 @@ async function psaGet(path) {
   if (!res.ok) {
     const body = (await res.text().catch(() => "")).slice(0, 300).replace(/\s+/g, " ");
     console.error(`PSA ${res.status} bei ${path}: ${body}`);
+    if (res.status === 429) {
+      const wait = Number(res.headers.get("retry-after")) || 3600;
+      budget.blockedUntil = Date.now() + wait * 1000;
+      throw new Error("PSA_QUOTA");
+    }
     if (res.status === 500) throw new Error("PSA_AUTH_OR_SERVER");
     throw new Error(`PSA_HTTP_${res.status}`);
   }
@@ -145,8 +163,10 @@ app.get("/api/status/:number", async (req, res) => {
     cache.set(psaNumber, { at: Date.now(), data });
     res.json(data);
   } catch (err) {
-    console.error(err);
-    res.status(502).json({ error: "PSA_UNAVAILABLE" });
+    // Lieber den letzten bekannten Stand zeigen als einen Fehler.
+    if (hit) return res.json(hit.data);
+    console.error(err.message);
+    res.status(503).json({ error: err.message === "PSA_QUOTA" ? "PSA_QUOTA" : "PSA_UNAVAILABLE" });
   }
 });
 
@@ -163,6 +183,8 @@ app.get("/api/debug/:psaNumber", async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.send("ok"));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, psaCallsToday: budget.used, dailyLimit: Number(PSA_DAILY_LIMIT) })
+);
 
 app.listen(PORT, () => console.log(`Status-Check läuft auf Port ${PORT}`));
