@@ -47,12 +47,22 @@ function extractPsaNumber(input) {
 
 // ---------- PSA-Aufrufe ----------
 async function psaGet(path) {
+  const token = PSA_TOKEN.trim().replace(/^bearer\s+/i, "").replace(/^["']|["']$/g, "");
   const res = await fetch(`${PSA_BASE}${path}`, {
-    headers: { Authorization: `bearer ${PSA_TOKEN}`, "Content-Type": "application/json" },
+    headers: {
+      Authorization: `bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "User-Agent": "Mozilla/5.0 (compatible; CollectibleSubmission-StatusCheck/1.0)",
+    },
   });
   if (res.status === 204) return null;
-  if (res.status === 500) throw new Error("PSA_AUTH_OR_SERVER");
-  if (!res.ok) throw new Error(`PSA_HTTP_${res.status}`);
+  if (!res.ok) {
+    const body = (await res.text().catch(() => "")).slice(0, 300).replace(/\s+/g, " ");
+    console.error(`PSA ${res.status} bei ${path}: ${body}`);
+    if (res.status === 500) throw new Error("PSA_AUTH_OR_SERVER");
+    throw new Error(`PSA_HTTP_${res.status}`);
+  }
   const text = await res.text();
   if (!text) return null;
   try { return JSON.parse(text); } catch { return null; }
