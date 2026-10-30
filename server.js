@@ -6,14 +6,16 @@
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
+import fs from "node:fs";
+import path from "node:path";
 
 const {
   PORT = 3000,
   PSA_TOKEN,
   ALLOWED_ORIGINS = "",
   CS_NUMBER_PATTERN = "^#?(\\d{6,12})$",
-  CACHE_MINUTES = "180",
-  PSA_DAILY_LIMIT = "90",
+  DATA_DIR = "./data",
+  PSA_DAILY_LIMIT = "135",
   ADMIN_KEY,
 } = process.env;
 
@@ -24,17 +26,44 @@ if (!PSA_TOKEN) {
 
 const PSA_BASE = "https://api.psacard.com/publicapi";
 const csPattern = new RegExp(CS_NUMBER_PATTERN, "i");
-const cacheMs = Number(CACHE_MINUTES) * 60 * 1000;
-const cache = new Map();
+// ---------- Tages-Speicher ----------
+// Jede Nummer wird höchstens einmal pro Tag (deutsche Zeit) bei PSA abgefragt.
+// Alle weiteren Abfragen am selben Tag bekommen den gespeicherten Stand.
+// Der Speicher liegt in einer Datei, damit er einen Neustart übersteht.
+const berlinDay = () =>
+  new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Berlin" }).format(new Date());
+
+const storeFile = path.join(DATA_DIR, "status-cache.json");
+let store = {};
+try {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  store = JSON.parse(fs.readFileSync(storeFile, "utf8"));
+} catch { store = {}; }
+
+const inflight = new Map();
+let saveTimer = null;
+function saveStore() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    // Einträge älter als 30 Tage aufräumen
+    const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+    for (const [k, v] of Object.entries(store)) if (v.at < cutoff) delete store[k];
+    fs.writeFile(storeFile, JSON.stringify({ ...store, __budget: budget }), (err) => err && console.error("Speichern fehlgeschlagen:", err.message));
+  }, 1000);
+}
 
 // PSA erlaubt nur 100 Abrufe pro Tag und Token. Wir zählen mit und bleiben darunter.
 let budget = { day: new Date().toISOString().slice(0, 10), used: 0, blockedUntil: 0 };
+// Zähler aus dem Speicher übernehmen, damit ein Neustart das Tageslimit nicht zurücksetzt
+if (store.__budget && store.__budget.day === budget.day) budget = store.__budget;
+delete store.__budget;
 function takeBudget() {
   const today = new Date().toISOString().slice(0, 10);
   if (budget.day !== today) budget = { day: today, used: 0, blockedUntil: 0 };
   if (Date.now() < budget.blockedUntil) return false;
   if (budget.used >= Number(PSA_DAILY_LIMIT)) return false;
   budget.used += 1;
+  saveStore();
   return true;
 }
 
@@ -94,11 +123,10 @@ function hasData(json) {
   return true;
 }
 
+// Genau EIN PSA-Abruf pro Nummer.
 async function fetchProgress(psaNumber) {
   const sub = await psaGet(`/order/GetSubmissionProgress/${psaNumber}`);
   if (hasData(sub)) return { source: "submission", raw: sub };
-  const order = await psaGet(`/order/GetProgress/${psaNumber}`);
-  if (hasData(order)) return { source: "order", raw: order };
   return null;
 }
 
@@ -106,22 +134,47 @@ async function fetchProgress(psaNumber) {
 // PSA liefert die Schritte als Nummern (orderProgressSteps[].step).
 // Reihenfolge wie im PSA-Konto. Falls PSA andere Nummern nutzt: hier anpassen
 // (prüfen über /api/debug/<PSA-Nummer>?key=ADMIN_KEY).
-const STEP_NAMES_DE = [
+// PSA liefert die Schritte je nach Konto als Text (z. B. "Grading") oder als Nummer.
+// Beides wird hier in verständliche deutsche Namen übersetzt.
+const STEP_BY_NUMBER = [
   "Bei PSA eingegangen",
   "Auftrag wird vorbereitet",
   "Karten werden identifiziert",
   "Im Grading",
   "Karten werden eingeschweißt",
   "Qualitätskontrolle",
+  "Grading abgeschlossen",
   "Von PSA versendet",
 ];
+const STEP_BY_TEXT = [
+  [/arriv|receiv|eingang/i, "Bei PSA eingegangen"],
+  [/prep|vorbereit/i, "Auftrag wird vorbereitet"],
+  [/research|identif|\bid\b/i, "Karten werden identifiziert"],
+  [/photo|image|imaging|foto/i, "Fotos werden erstellt"],
+  [/grad/i, "Im Grading"],
+  [/assembl|encaps|slab|label/i, "Karten werden eingeschweißt"],
+  [/qa|quality|check|kontroll/i, "Qualitätskontrolle"],
+  [/complet|done|finish|abgeschl/i, "Grading abgeschlossen"],
+  [/ship|versand|versend/i, "Von PSA versendet"],
+];
 
-function buildFromPsa(psaNumber, raw) {
+function stepName(step, i) {
+  if (typeof step === "number" || /^\d+$/.test(String(step))) {
+    return STEP_BY_NUMBER[Number(step)] || `Schritt ${i + 1}`;
+  }
+  const t = String(step || "").trim();
+  if (!t) return `Schritt ${i + 1}`;
+  for (const [re, de] of STEP_BY_TEXT) if (re.test(t)) return de;
+  // Unbekannter Text: lesbar machen, z. B. "OrderPrep" -> "Order Prep"
+  return t.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ");
+}
+
+function buildFromPsa(psaNumber, raw, fetchedAt) {
   const steps = (raw.orderProgressSteps || [])
     .slice()
     .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
-    .map((s) => ({
-      name: STEP_NAMES_DE[s.step] || `Schritt ${Number(s.step) + 1}`,
+    .map((s, i) => ({
+      name: stepName(s.step ?? s.name ?? s.stepName, i),
       done: Boolean(s.completed),
     }));
 
@@ -137,14 +190,14 @@ function buildFromPsa(psaNumber, raw) {
     tracking: raw.shipped && raw.shipTrackingNumber
       ? { number: raw.shipTrackingNumber, carrier: raw.shipCarrier || null }
       : null,
-    updatedAt: new Date().toISOString(),
+    updatedAt: new Date(fetchedAt || Date.now()).toISOString(),
   };
 }
 
 async function buildStatus(psaNumber) {
   const result = await fetchProgress(psaNumber);
   if (!result) return null;
-  return buildFromPsa(psaNumber, result.raw);
+  return result.raw;
 }
 
 // ---------- Routen ----------
@@ -154,20 +207,48 @@ app.get("/api/status/:number", async (req, res) => {
     return res.status(400).json({ error: "INVALID_NUMBER" });
   }
 
-  const hit = cache.get(psaNumber);
-  if (hit && Date.now() - hit.at < cacheMs) return res.json(hit.data);
+  const today = berlinDay();
+  const hit = store[psaNumber];
+  // Einträge aus älteren Versionen ohne Rohdaten gelten als veraltet und werden einmal neu geholt
+  const usable = hit && (hit.notFound || hit.raw);
+  const show = (h) => res.json(buildFromPsa(psaNumber, h.raw, h.at));
+
+  // Heute schon abgefragt -> gespeicherten Stand ausgeben, PSA wird nicht angefragt.
+  if (usable && hit.day === today) {
+    if (hit.notFound) return res.status(404).json({ error: "NOT_FOUND" });
+    return show(hit);
+  }
 
   try {
-    const data = await buildStatus(psaNumber);
-    if (!data) return res.status(404).json({ error: "NOT_FOUND" });
-    cache.set(psaNumber, { at: Date.now(), data });
-    res.json(data);
+    // Fragen mehrere Kunden gleichzeitig dieselbe Nummer ab, geht trotzdem nur EIN Abruf an PSA
+    if (!inflight.has(psaNumber)) {
+      inflight.set(psaNumber, buildStatus(psaNumber).finally(() => inflight.delete(psaNumber)));
+    }
+    const raw = await inflight.get(psaNumber);
+    if (!raw) {
+      // Auch "nicht gefunden" wird für den Tag gemerkt, damit falsche Nummern kein Kontingent verbrauchen.
+      store[psaNumber] = { day: today, at: Date.now(), notFound: true, raw: hit?.raw, lastAt: hit?.at };
+      saveStore();
+      return res.status(404).json({ error: "NOT_FOUND" });
+    }
+    store[psaNumber] = { day: today, at: Date.now(), raw };
+    saveStore();
+    show(store[psaNumber]);
   } catch (err) {
-    // Lieber den letzten bekannten Stand zeigen als einen Fehler.
-    if (hit) return res.json(hit.data);
+    // Kein Abruf möglich -> letzten bekannten Stand zeigen (z. B. von gestern).
+    if (hit?.raw) return res.json(buildFromPsa(psaNumber, hit.raw, hit.lastAt || hit.at));
     console.error(err.message);
     res.status(503).json({ error: err.message === "PSA_QUOTA" ? "PSA_QUOTA" : "PSA_UNAVAILABLE" });
   }
+});
+
+// Gespeicherte Rohdaten ansehen, OHNE PSA-Abruf: /api/cache/14663791?key=ADMIN_KEY
+app.get("/api/cache/:psaNumber", (req, res) => {
+  if (!ADMIN_KEY || req.query.key !== ADMIN_KEY) return res.status(403).end();
+  const nr = extractPsaNumber(req.params.psaNumber);
+  const hit = nr && store[nr];
+  if (!hit) return res.status(404).json({ error: "nicht im Speicher" });
+  res.json({ abgerufen: new Date(hit.at).toISOString(), tag: hit.day, raw: hit.raw || null, alterEintrag: !hit.raw });
 });
 
 // Roh-Antwort von PSA ansehen, zum Feinjustieren der Anzeige.
@@ -176,15 +257,19 @@ app.get("/api/debug/:psaNumber", async (req, res) => {
   if (!ADMIN_KEY || req.query.key !== ADMIN_KEY) return res.status(403).end();
   try {
     const sub = await psaGet(`/order/GetSubmissionProgress/${req.params.psaNumber}`);
-    const order = await psaGet(`/order/GetProgress/${req.params.psaNumber}`);
-    res.json({ submissionProgress: sub, orderProgress: order });
+    res.json({ submissionProgress: sub });
   } catch (err) {
     res.status(502).json({ error: String(err.message) });
   }
 });
 
 app.get("/health", (_req, res) =>
-  res.json({ ok: true, psaCallsToday: budget.used, dailyLimit: Number(PSA_DAILY_LIMIT) })
+  res.json({
+    ok: true,
+    psaCallsToday: budget.used,
+    dailyLimit: Number(PSA_DAILY_LIMIT),
+    numbersCheckedToday: Object.values(store).filter((v) => v.day === berlinDay()).length,
+  })
 );
 
 app.listen(PORT, () => console.log(`Status-Check läuft auf Port ${PORT}`));
