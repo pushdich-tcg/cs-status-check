@@ -3,6 +3,7 @@
 // fragt den Fortschritt bei der PSA Public API ab und liefert ihn aufbereitet zurück.
 // Der PSA-Token bleibt dabei immer auf dem Server und landet nie im Shop.
 
+import { mountOrders } from "./orders.js";
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
