@@ -23,6 +23,7 @@ const CFG = {
   mailFrom: E.MAIL_FROM || E.SMTP_USER || "",
   replyTo: E.MAIL_REPLY_TO || "",
   autoPsa: (E.AUTO_PSA_MAILS || "true") !== "false",
+  fulfillMail: (E.FULFILL_SEND_MAIL || "true") !== "false",
 };
 
 // ---------- Stufen ----------
@@ -147,7 +148,8 @@ export function mountOrders(app, { DATA_DIR, getStatus, berlinDay, extractPsaNum
 
     const subBox = showSubs ? `<table role="presentation" width="100%" style="border-collapse:collapse;margin:0 0 20px;background:#071A22;border:1px solid ${C.cyan};border-radius:12px"><tr><td style="padding:16px 18px"><p style="margin:0 0 6px;font-size:12px;color:${C.cyan};font-weight:bold;letter-spacing:1px;text-transform:uppercase">PSA Submission-Nummer${subs.length > 1 ? "n" : ""}</p>${subs.map((n) => `<p style="margin:6px 0"><span style="font-size:26px;font-weight:bold;color:${C.ink};letter-spacing:1px">#${esc(n)}</span> &nbsp;<a href="${link(n)}" style="color:${C.cyan};font-size:14px;font-weight:bold">Status ansehen &rarr;</a></p>`).join("")}<p style="margin:8px 0 0;font-size:12px;color:${C.muted}">Speichere dir die Nummer. Damit siehst du im Status-Check jederzeit, wo deine Karten gerade sind.</p></td></tr></table>` : "";
     const items = o.items.map((i) => `<tr><td style="padding:7px 0;border-bottom:1px solid ${C.line};font-size:14px;color:${C.ink}">${esc(i.qty)}× ${esc(i.title)}${i.variant ? ` <span style="color:${C.muted}">(${esc(i.variant)})</span>` : ""}</td></tr>`).join("");
-    const track = kind === "versendet" && o.tracking ? `<p style="margin:16px 0 0;font-size:14px;color:${C.ink}">Sendungsnummer: <b>${esc(o.tracking)}</b><br><a href="${CFG.trackingUrl}${encodeURIComponent(o.tracking)}" style="color:${C.cyan}">Sendung verfolgen</a></p>` : "";
+    const trackHref = o.trackingUrl || (CFG.trackingUrl + encodeURIComponent(String(o.tracking || "").split(/[,\s]+/)[0]));
+    const track = kind === "versendet" && o.tracking ? `<p style="margin:16px 0 0;font-size:14px;color:${C.ink}">Sendungsnummer: <b>${esc(o.tracking)}</b>${o.carrier ? ` (${esc(o.carrier)})` : ""}<br><a href="${esc(trackHref)}" style="color:${C.cyan}">Sendung verfolgen</a></p>` : "";
     const btn = showSubs ? `<p style="margin:22px 0 6px"><a href="${link(subs[0])}" style="display:inline-block;background:${C.cyan};color:#03131A;text-decoration:none;font-weight:bold;font-size:14px;padding:12px 18px;border-radius:8px">Zum Status-Check</a></p>` : "";
 
     const html = `<div style="background:${C.bg};padding:24px 12px;font-family:Arial,Helvetica,sans-serif;color:${C.ink}"><table role="presentation" width="100%" style="max-width:560px;margin:0 auto;border-collapse:collapse;background:${C.card};border:1px solid ${C.line};border-radius:14px;overflow:hidden"><tr><td style="background:#000;padding:18px 22px;border-bottom:3px solid ${C.cyan}"><span style="font-size:18px;font-weight:bold;font-style:italic;text-transform:uppercase;letter-spacing:.5px;color:${C.ink}">${esc(CFG.shopName)}</span></td></tr><tr><td style="padding:24px 22px 8px"><p style="margin:0 0 4px;font-size:12px;color:${C.muted}">Bestellung ${esc(o.nr)}</p><h1 style="margin:0 0 14px;font-size:24px;line-height:1.15;text-transform:uppercase;font-style:italic;color:${C.ink}">${esc(subject)}</h1><p style="margin:0 0 18px;font-size:15px;line-height:1.5;color:${C.ink}">Hallo${first ? " " + esc(first) : ""},<br>${esc(text)}</p>${subBox}<table role="presentation" style="border-collapse:collapse;margin:0 0 18px">${steps}</table>${items ? `<p style="margin:0 0 4px;font-size:12px;color:${C.muted}">Dein Auftrag</p><table role="presentation" width="100%" style="border-collapse:collapse">${items}</table>` : ""}${track}${btn}</td></tr><tr><td style="padding:16px 22px 22px;font-size:12px;color:${C.muted};border-top:1px solid ${C.line}">Fragen? Antworte einfach auf diese E-Mail.<br>${esc(CFG.shopName)} · ${esc(CFG.storeAddress)}</td></tr></table></div>`;
@@ -165,13 +167,50 @@ export function mountOrders(app, { DATA_DIR, getStatus, berlinDay, extractPsaNum
   const log = (o, msg) => { o.log = o.log || []; o.log.unshift({ at: now(), msg }); o.log = o.log.slice(0, 30); };
 
   // ---------- Shopify-Webhook: neue Bestellung ----------
-  app.post("/webhooks/shopify/orders-create", express.raw({ type: "*/*", limit: "2mb" }), (req, res) => {
+  function verifyShopify(req, res) {
     const hmac = req.get("X-Shopify-Hmac-Sha256") || "";
-    if (!CFG.webhookSecret) return res.status(500).send("SHOPIFY_WEBHOOK_SECRET fehlt");
+    if (!CFG.webhookSecret) { res.status(500).send("SHOPIFY_WEBHOOK_SECRET fehlt"); return null; }
     const digest = crypto.createHmac("sha256", CFG.webhookSecret).update(req.body).digest("base64");
     const ok = hmac.length === digest.length && crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(digest));
-    if (!ok) return res.status(401).send("ungültige Signatur");
-    let p; try { p = JSON.parse(req.body.toString("utf8")); } catch { return res.status(400).send("kein JSON"); }
+    if (!ok) { res.status(401).send("ungültige Signatur"); return null; }
+    try { return JSON.parse(req.body.toString("utf8")); } catch { res.status(400).send("kein JSON"); return null; }
+  }
+
+  // ---------- Shopify-Webhook: Sendung erstellt (Versand) ----------
+  app.post("/webhooks/shopify/fulfillment", express.raw({ type: "*/*", limit: "2mb" }), async (req, res) => {
+    const f = verifyShopify(req, res); if (!f) return;
+    res.status(200).send("ok"); // Shopify sofort antworten, Rest im Hintergrund
+    try {
+      const nr = String(f.name || "").split(".")[0].replace(/\D/g, "");
+      const o = db.orders[String(f.order_id)] || Object.values(db.orders).find((x) => nr && String(x.nr).replace(/\D/g, "") === nr);
+      if (!o) { console.warn("Versand-Webhook: Auftrag nicht gefunden", f.order_id, f.name); return; }
+      if (f.status && /cancel|failure|error/i.test(f.status)) return;
+      const nums = (f.tracking_numbers && f.tracking_numbers.length ? f.tracking_numbers : [f.tracking_number]).filter(Boolean);
+      if (nums.length) {
+        const all = new Set(String(o.tracking || "").split(/[,\s]+/).filter(Boolean).concat(nums));
+        o.tracking = [...all].join(", ");
+        o.trackingUrl = (f.tracking_urls && f.tracking_urls[0]) || f.tracking_url || o.trackingUrl || "";
+        o.carrier = f.tracking_company || o.carrier || "";
+      }
+      const si = STAGES.findIndex((s) => s.key === "versendet");
+      for (let i = 0; i <= si; i++) o.stages[STAGES[i].key] = o.stages[STAGES[i].key] || now();
+      let result;
+      if (o.pickup) result = "abgeholt, ohne Mail";
+      else if (!CFG.fulfillMail) result = "ohne Mail (Shopify verschickt die Versandbestätigung)";
+      else if (o.mails.versendet) result = "Mail war schon raus";
+      else {
+        // Sofort als gesendet markieren, damit ein zweites Paket derselben Bestellung keine zweite Mail auslöst
+        o.mails.versendet = now();
+        await new Promise((r) => setTimeout(r, 3000)); // kurz warten, falls weitere Pakete gleichzeitig gemeldet werden
+        try { result = await sendMail(o, "versendet"); } catch (e) { delete o.mails.versendet; result = "Fehler: " + e.message; }
+      }
+      log(o, `Automatisch aus Shopify: Versendet${nums.length ? " · " + nums.join(", ") : ""} · ${result}`);
+      save();
+    } catch (e) { console.error("Versand-Webhook:", e.message); }
+  });
+
+  app.post("/webhooks/shopify/orders-create", express.raw({ type: "*/*", limit: "2mb" }), (req, res) => {
+    const p = verifyShopify(req, res); if (!p) return;
     const id = String(p.id || p.name);
     if (db.orders[id] || Object.values(db.orders).some((o) => String(o.nr).replace(/\D/g, "") === String(p.name || p.order_number || "").replace(/\D/g, ""))) return res.status(200).send("schon vorhanden");
     const items = (p.line_items || []).map((l) => ({ title: l.title || l.name, variant: l.variant_title && l.variant_title !== "Default Title" ? l.variant_title : "", qty: l.quantity || 1 }));
