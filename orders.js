@@ -173,7 +173,7 @@ export function mountOrders(app, { DATA_DIR, getStatus, berlinDay, extractPsaNum
     if (!ok) return res.status(401).send("ungültige Signatur");
     let p; try { p = JSON.parse(req.body.toString("utf8")); } catch { return res.status(400).send("kein JSON"); }
     const id = String(p.id || p.name);
-    if (db.orders[id]) return res.status(200).send("schon vorhanden");
+    if (db.orders[id] || Object.values(db.orders).some((o) => String(o.nr).replace(/\D/g, "") === String(p.name || p.order_number || "").replace(/\D/g, ""))) return res.status(200).send("schon vorhanden");
     const items = (p.line_items || []).map((l) => ({ title: l.title || l.name, variant: l.variant_title && l.variant_title !== "Default Title" ? l.variant_title : "", qty: l.quantity || 1 }));
     const ship = (p.shipping_lines || []).map((s) => s.title || "").join(" ");
     const cust = p.customer || {};
@@ -248,6 +248,60 @@ export function mountOrders(app, { DATA_DIR, getStatus, berlinDay, extractPsaNum
   });
 
   app.post("/admin/api/orders/:id/delete", (req, res) => { delete db.orders[req.params.id]; save(); res.json({ ok: true }); });
+
+  // ---------- Import: Shopify-Bestellexport (CSV) ----------
+  function parseCsv(text) {
+    const rows = []; let row = [], cell = "", q = false;
+    text = String(text || "").replace(/^\uFEFF/, "");
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (q) {
+        if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+        else if (c === '"') q = false;
+        else cell += c;
+      } else if (c === '"') q = true;
+      else if (c === ",") { row.push(cell); cell = ""; }
+      else if (c === "\n" || c === "\r") {
+        if (c === "\r" && text[i + 1] === "\n") i++;
+        row.push(cell); rows.push(row); row = []; cell = "";
+      } else cell += c;
+    }
+    if (cell !== "" || row.length) { row.push(cell); rows.push(row); }
+    return rows.filter((r) => r.some((x) => String(x).trim() !== ""));
+  }
+  const toIso = (v) => { const d = new Date(String(v || "").replace(" ", "T").replace(/ ([+-]\d{2})(\d{2})$/, "$1:$2")); return isNaN(d) ? now() : d.toISOString(); };
+
+  app.post("/admin/api/import-csv", express.text({ type: "*/*", limit: "20mb" }), (req, res) => {
+    const onlyOpen = String(req.query.open || "1") === "1";
+    const rows = parseCsv(req.body);
+    if (rows.length < 2) return res.status(400).json({ error: "Die Datei ist leer oder kein Shopify-Export." });
+    const head = rows[0].map((h) => String(h).trim().toLowerCase());
+    const col = (name) => head.indexOf(name.toLowerCase());
+    const C = { name: col("Name"), email: col("Email"), fin: col("Financial Status"), ful: col("Fulfillment Status"), created: col("Created at"),
+      qty: col("Lineitem quantity"), item: col("Lineitem name"), ship: col("Shipping Method"), bill: col("Billing Name"), shipName: col("Shipping Name"), id: col("Id"), cancelled: col("Cancelled at") };
+    if (C.name < 0 || C.item < 0) return res.status(400).json({ error: "Spalten „Name“ und „Lineitem name“ fehlen. Bitte den Export unter Bestellungen → Exportieren verwenden." });
+    const byNr = {};
+    for (const r of rows.slice(1)) {
+      const nr = String(r[C.name] || "").trim(); if (!nr) continue;
+      const o = byNr[nr] || (byNr[nr] = { nr, items: [] });
+      const g = (k) => (C[k] >= 0 ? String(r[C[k]] || "").trim() : "");
+      for (const k of ["email", "fin", "ful", "created", "ship", "bill", "shipName", "id", "cancelled"]) if (!o[k] && g(k)) o[k] = g(k);
+      const title = g("item"); if (title) o.items.push({ title, variant: "", qty: Number(g("qty")) || 1 });
+    }
+    const known = new Set(Object.values(db.orders).map((o) => String(o.nr).replace(/\D/g, "")));
+    let added = 0, skipped = 0, closed = 0;
+    for (const x of Object.values(byNr)) {
+      if (known.has(x.nr.replace(/\D/g, "")) || (x.id && db.orders[x.id])) { skipped++; continue; }
+      if (onlyOpen && (/^(fulfilled|erf)/i.test(x.ful) || x.cancelled || /refunded|voided|erstattet|storniert/i.test(x.fin))) { closed++; continue; }
+      const id = x.id || "imp-" + x.nr.replace(/\D/g, "");
+      db.orders[id] = { id, nr: x.nr, created: toIso(x.created), name: x.bill || x.shipName || "", email: x.email || "", items: x.items,
+        grader: graderOf(x.items), pickup: /abhol|laden|pickup|pick-up/i.test(x.ship || ""), psa: "", tracking: "", note: "",
+        stages: {}, mails: {}, log: [{ at: now(), msg: "Aus Shopify-Export importiert" }], archived: false };
+      known.add(x.nr.replace(/\D/g, "")); added++;
+    }
+    save();
+    res.json({ added, skipped, closed, total: Object.keys(byNr).length });
+  });
 
   // ---------- Automatisch: Grades fertig ----------
   async function autoCheck(force = false) {
