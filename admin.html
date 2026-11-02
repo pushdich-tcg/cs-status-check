@@ -91,6 +91,12 @@
   <label>Test-Mail an<input name="to" type="email" placeholder="deine@adresse.de" data-test-to></label>
   <button class="b-gh" type="button" data-test>Test-Mail senden</button>
   <button class="b-gh" type="button" data-auto>PSA jetzt prüfen (Grades fertig?)</button>
+  <hr style="border:0;border-top:1px solid var(--ln);margin:6px 0">
+  <b>Bestellungen aus Shopify importieren</b>
+  <p class="mut" style="margin:0">Shopify → Bestellungen → <b>Exportieren</b> → „Alle Bestellungen“, „CSV für Excel, Numbers …“ → die Datei aus der Mail hier auswählen. Doppelte werden übersprungen, es gehen keine Mails raus.</p>
+  <input type="file" accept=".csv,text/csv" data-csv>
+  <label style="display:flex;gap:8px;align-items:center;color:var(--ink)"><input type="checkbox" data-open checked> Nur offene Bestellungen (noch nicht versendet, nicht storniert)</label>
+  <button class="b-gh" type="button" data-import>Importieren</button>
   <p data-more-out style="margin:0;font-weight:700" aria-live="polite"></p>
   <p class="mut" style="margin:0">Der Server prüft das sonst automatisch einmal am Tag ab 9 Uhr. Jede PSA-Nummer wird dabei höchstens einmal am Tag abgefragt, gemeinsam mit dem Status-Check der Kunden.</p>
   <div style="text-align:right"><button class="b-cy" value="ok">Schließen</button></div>
@@ -229,6 +235,18 @@
     api('POST', '/admin/api/test-mail', { to: to }).then(function (r) {
       if (r.result === 'probelauf') moreOut('Nicht gesendet: Mail-Versand ist noch nicht eingerichtet (SMTP-Variablen in Railway fehlen).', false);
       else moreOut('Gesendet an ' + to + '. Bitte auch im Spam-Ordner nachsehen.', true);
+    }).catch(function (er) { moreOut('Fehler: ' + er.message, false); });
+  });
+  $('[data-import]').addEventListener('click', function () {
+    var f = $('[data-csv]').files[0];
+    if (!f) { moreOut('Bitte zuerst die CSV-Datei auswählen.', false); return; }
+    moreOut('Importiere …', true);
+    f.text().then(function (txt) {
+      return fetch('/admin/api/import-csv?open=' + ($('[data-open]').checked ? '1' : '0'), { method: 'POST', headers: { 'Content-Type': 'text/csv' }, body: txt, credentials: 'same-origin' })
+        .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || 'Fehler'); return j; }); });
+    }).then(function (r) {
+      moreOut(r.added + ' Aufträge übernommen · ' + r.skipped + ' schon vorhanden' + (r.closed ? ' · ' + r.closed + ' erledigte übersprungen' : '') + '.', true);
+      load();
     }).catch(function (er) { moreOut('Fehler: ' + er.message, false); });
   });
   $('[data-auto]').addEventListener('click', function () {
