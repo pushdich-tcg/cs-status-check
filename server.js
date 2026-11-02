@@ -177,7 +177,25 @@ function buildFromPsa(psaNumber, raw, fetchedAt) {
     .map((s, i) => ({
       name: stepName(s.step ?? s.name ?? s.stepName, i),
       done: Boolean(s.completed),
+      raw: String(s.step ?? s.name ?? s.stepName ?? ""),
     }));
+
+  // Doppelte Namen vermeiden (PSA hat z. B. zwei Prüfschritte)
+  const SECOND = {
+    "Qualitätskontrolle": "Abschließende Kontrolle",
+    "Im Grading": "Grading wird geprüft",
+    "Karten werden identifiziert": "Angaben werden geprüft",
+    "Auftrag wird vorbereitet": "Auftrag wird weiter vorbereitet",
+  };
+  const seen = new Set();
+  for (const st of steps) {
+    if (seen.has(st.name)) {
+      const pretty = st.raw && !/^\d+$/.test(st.raw) ? st.raw.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ") : "";
+      st.name = SECOND[st.name] || pretty || st.name + " (2)";
+    }
+    seen.add(st.name);
+    delete st.raw;
+  }
 
   // Interne PSA-Flags (accountingHold) werden bewusst NICHT an Kunden ausgegeben.
   if (raw.accountingHold) console.warn(`Accounting Hold bei PSA-Nummer ${psaNumber}`);
