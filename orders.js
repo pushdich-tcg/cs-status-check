@@ -73,11 +73,45 @@ export function mountOrders(app, { DATA_DIR, getStatus, berlinDay, extractPsaNum
   const graderOf = (items) => (items.length && items.every((i) => /gsg|gold standard/i.test(i.title)) ? "GSG" : "PSA");
 
   // ---------- Mail ----------
-  const smtpReady = Boolean(E.SMTP_HOST && E.SMTP_USER && E.SMTP_PASS);
-  const transport = smtpReady
-    ? nodemailer.createTransport({ host: E.SMTP_HOST, port: Number(E.SMTP_PORT || 587), secure: String(E.SMTP_SECURE || "false") === "true", auth: { user: E.SMTP_USER, pass: E.SMTP_PASS } })
+  // Drei Wege: BREVO_API_KEY (empfohlen auf Railway), RESEND_API_KEY oder SMTP (z. B. Gmail, braucht Railway Pro).
+  const provider = E.BREVO_API_KEY ? "brevo" : E.RESEND_API_KEY ? "resend" : (E.SMTP_HOST && E.SMTP_USER && E.SMTP_PASS) ? "smtp" : "";
+  const smtpReady = Boolean(provider);
+  const transport = provider === "smtp"
+    ? nodemailer.createTransport({ host: E.SMTP_HOST, port: Number(E.SMTP_PORT || 587), secure: String(E.SMTP_SECURE || "false") === "true",
+        auth: { user: E.SMTP_USER, pass: E.SMTP_PASS }, connectionTimeout: 15000, greetingTimeout: 15000, socketTimeout: 20000 })
     : null;
-  if (!smtpReady) console.warn("SMTP nicht eingerichtet: Mails werden NICHT versendet, nur protokolliert.");
+  if (!provider) console.warn("Mail-Versand nicht eingerichtet: Mails werden NICHT versendet, nur protokolliert.");
+  else console.log("Mail-Versand über:", provider);
+
+  async function deliver({ to, subject, html, text }) {
+    const fromName = CFG.shopName, fromMail = CFG.mailFrom;
+    if (!fromMail) throw new Error("MAIL_FROM fehlt");
+    const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 20000);
+    try {
+      if (provider === "brevo") {
+        const r = await fetch("https://api.brevo.com/v3/smtp/email", { method: "POST", signal: ctl.signal,
+          headers: { "api-key": E.BREVO_API_KEY, "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({ sender: { name: fromName, email: fromMail }, to: [{ email: to }], replyTo: CFG.replyTo ? { email: CFG.replyTo } : undefined, subject, htmlContent: html, textContent: text }) });
+        if (!r.ok) throw new Error("Brevo " + r.status + ": " + (await r.text()).slice(0, 200));
+        return;
+      }
+      if (provider === "resend") {
+        const r = await fetch("https://api.resend.com/emails", { method: "POST", signal: ctl.signal,
+          headers: { authorization: "Bearer " + E.RESEND_API_KEY, "content-type": "application/json" },
+          body: JSON.stringify({ from: `${fromName} <${fromMail}>`, to: [to], reply_to: CFG.replyTo || undefined, subject, html, text }) });
+        if (!r.ok) throw new Error("Resend " + r.status + ": " + (await r.text()).slice(0, 200));
+        return;
+      }
+      await transport.sendMail({ from: `"${fromName}" <${fromMail}>`, to, replyTo: CFG.replyTo || undefined, subject, html, text });
+    } catch (e) {
+      if (e.name === "AbortError" || /timeout|ETIMEDOUT|ECONNREFUSED|Greeting never received/i.test(e.message || "")) {
+        throw new Error(provider === "smtp"
+          ? "Keine Verbindung zum Mailserver. Railway blockiert SMTP im aktuellen Tarif. Lösung: BREVO_API_KEY verwenden oder Railway Pro."
+          : "Zeitüberschreitung beim Mail-Dienst. Bitte später erneut versuchen.");
+      }
+      throw e;
+    } finally { clearTimeout(timer); }
+  }
 
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const fmt = (iso) => (iso ? new Date(iso).toLocaleDateString("de-DE", { timeZone: "Europe/Berlin" }) : "");
@@ -124,8 +158,8 @@ export function mountOrders(app, { DATA_DIR, getStatus, berlinDay, extractPsaNum
   async function sendMail(o, kind) {
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(o.email || "")) throw new Error("Keine gültige E-Mail-Adresse");
     const m = buildMail(o, kind);
-    if (!transport) { console.log(`[Probelauf] Mail "${m.subject}" an ${o.email}`); return "probelauf"; }
-    await transport.sendMail({ from: `"${CFG.shopName}" <${CFG.mailFrom}>`, to: o.email, replyTo: CFG.replyTo || undefined, subject: m.subject, html: m.html, text: m.text });
+    if (!provider) { console.log(`[Probelauf] Mail "${m.subject}" an ${o.email}`); return "probelauf"; }
+    await deliver({ to: o.email, subject: m.subject, html: m.html, text: m.text });
     return "gesendet";
   }
   const log = (o, msg) => { o.log = o.log || []; o.log.unshift({ at: now(), msg }); o.log = o.log.slice(0, 30); };
@@ -251,7 +285,10 @@ export function mountOrders(app, { DATA_DIR, getStatus, berlinDay, extractPsaNum
     try { res.json({ result: await sendMail(demo, "bei_grader") }); }
     catch (e) {
       console.error("Test-Mail fehlgeschlagen:", e.message);
-      const hint = /535|Invalid login|Username and Password/i.test(e.message) ? "Anmeldung bei Gmail abgelehnt. App-Passwort prüfen (ohne Leerzeichen) und SMTP_USER = Gmail-Adresse." : e.message;
+      const hint = /535|Invalid login|Username and Password/i.test(e.message) ? "Anmeldung bei Gmail abgelehnt. App-Passwort prüfen (ohne Leerzeichen) und SMTP_USER = Gmail-Adresse."
+        : /Brevo 40[01]/.test(e.message) ? "Brevo lehnt ab: API-Schlüssel prüfen bzw. Absender (MAIL_FROM) in Brevo bestätigen."
+        : /Resend 40[0-3]/.test(e.message) ? "Resend lehnt ab: API-Schlüssel prüfen bzw. Domain von MAIL_FROM in Resend bestätigen."
+        : e.message;
       res.status(400).json({ error: hint });
     }
   });
