@@ -248,7 +248,12 @@ export function mountOrders(app, { DATA_DIR, getStatus, berlinDay, extractPsaNum
   app.post("/admin/api/test-mail", async (req, res) => {
     const to = String(req.body?.to || "").trim();
     const demo = { nr: "#1041", name: "Luca Brenner", email: to, items: [{ qty: 2, title: "PSA Grading Standard" }, { qty: 1, title: "PSA Dual Grading Express – Karte & Autogramm", variant: "Nur Autogrammbewertung" }], grader: "PSA", pickup: false, psa: "14348423", tracking: "", stages: { eingang: now(), an_grader: now() }, mails: {} };
-    try { res.json({ result: await sendMail(demo, "bei_grader") }); } catch (e) { res.status(400).json({ error: e.message }); }
+    try { res.json({ result: await sendMail(demo, "bei_grader") }); }
+    catch (e) {
+      console.error("Test-Mail fehlgeschlagen:", e.message);
+      const hint = /535|Invalid login|Username and Password/i.test(e.message) ? "Anmeldung bei Gmail abgelehnt. App-Passwort prüfen (ohne Leerzeichen) und SMTP_USER = Gmail-Adresse." : e.message;
+      res.status(400).json({ error: hint });
+    }
   });
 
   // ---------- Admin-Oberfläche ----------
