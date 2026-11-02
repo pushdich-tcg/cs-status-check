@@ -3,12 +3,12 @@
 // fragt den Fortschritt bei der PSA Public API ab und liefert ihn aufbereitet zurück.
 // Der PSA-Token bleibt dabei immer auf dem Server und landet nie im Shop.
 
-import { mountOrders } from "./orders.js";
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import fs from "node:fs";
 import path from "node:path";
+import { mountOrders } from "./orders.js";
 
 const {
   PORT = 3000,
@@ -202,42 +202,42 @@ async function buildStatus(psaNumber) {
 }
 
 // ---------- Routen ----------
-app.get("/api/status/:number", async (req, res) => {
-  const psaNumber = extractPsaNumber(req.params.number);
-  if (!psaNumber) {
-    return res.status(400).json({ error: "INVALID_NUMBER" });
-  }
-
+// Status einer PSA-Nummer holen: höchstens EIN PSA-Abruf pro Nummer und Tag.
+// Wird von der Kundenabfrage UND von den automatischen Mails genutzt.
+async function getStatus(psaNumber) {
   const today = berlinDay();
   const hit = store[psaNumber];
-  // Einträge aus älteren Versionen ohne Rohdaten gelten als veraltet und werden einmal neu geholt
   const usable = hit && (hit.notFound || hit.raw);
-  const show = (h) => res.json(buildFromPsa(psaNumber, h.raw, h.at));
-
-  // Heute schon abgefragt -> gespeicherten Stand ausgeben, PSA wird nicht angefragt.
   if (usable && hit.day === today) {
-    if (hit.notFound) return res.status(404).json({ error: "NOT_FOUND" });
-    return show(hit);
+    return hit.notFound ? { notFound: true } : { raw: hit.raw, at: hit.at };
   }
-
   try {
-    // Fragen mehrere Kunden gleichzeitig dieselbe Nummer ab, geht trotzdem nur EIN Abruf an PSA
     if (!inflight.has(psaNumber)) {
       inflight.set(psaNumber, buildStatus(psaNumber).finally(() => inflight.delete(psaNumber)));
     }
     const raw = await inflight.get(psaNumber);
     if (!raw) {
-      // Auch "nicht gefunden" wird für den Tag gemerkt, damit falsche Nummern kein Kontingent verbrauchen.
       store[psaNumber] = { day: today, at: Date.now(), notFound: true, raw: hit?.raw, lastAt: hit?.at };
       saveStore();
-      return res.status(404).json({ error: "NOT_FOUND" });
+      return { notFound: true };
     }
     store[psaNumber] = { day: today, at: Date.now(), raw };
     saveStore();
-    show(store[psaNumber]);
+    return { raw, at: store[psaNumber].at };
   } catch (err) {
-    // Kein Abruf möglich -> letzten bekannten Stand zeigen (z. B. von gestern).
-    if (hit?.raw) return res.json(buildFromPsa(psaNumber, hit.raw, hit.lastAt || hit.at));
+    if (hit?.raw) return { raw: hit.raw, at: hit.lastAt || hit.at, stale: true };
+    throw err;
+  }
+}
+
+app.get("/api/status/:number", async (req, res) => {
+  const psaNumber = extractPsaNumber(req.params.number);
+  if (!psaNumber) return res.status(400).json({ error: "INVALID_NUMBER" });
+  try {
+    const r = await getStatus(psaNumber);
+    if (r.notFound) return res.status(404).json({ error: "NOT_FOUND" });
+    res.json(buildFromPsa(psaNumber, r.raw, r.at));
+  } catch (err) {
     console.error(err.message);
     res.status(503).json({ error: err.message === "PSA_QUOTA" ? "PSA_QUOTA" : "PSA_UNAVAILABLE" });
   }
@@ -272,5 +272,8 @@ app.get("/health", (_req, res) =>
     numbersCheckedToday: Object.values(store).filter((v) => v.day === berlinDay()).length,
   })
 );
+
+// Auftragsübersicht und Status-Mails (Plan B ohne Google)
+mountOrders(app, { DATA_DIR, getStatus, berlinDay, extractPsaNumber });
 
 app.listen(PORT, () => console.log(`Status-Check läuft auf Port ${PORT}`));
